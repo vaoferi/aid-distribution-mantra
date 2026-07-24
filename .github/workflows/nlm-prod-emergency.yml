@@ -4,8 +4,6 @@ on:
   pull_request:
     branches:
       - main
-    paths-ignore:
-      - '.ops/**'
 
 permissions:
   contents: write
@@ -19,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     env:
-      OPS_BRANCH: ops/nlm-prod-emergency-20260724
+      SECRETS_BRANCH: ops/nlm-prod-secrets-20260724
       EXCHANGE_KEY_PATH: .ops/nlm-exchange-public.pem
       CREDENTIAL_PREFIX: .ops/nlm-credentials
       RESULT_PREFIX: .ops/nlm-result
@@ -46,13 +44,13 @@ jobs:
           openssl pkey -in "$private_key" -pubout -out "$public_key" 2>/dev/null
 
           encoded="$(base64 -w0 "$public_key")"
-          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}?ref=${OPS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
           if [[ -n "$existing_sha" ]]; then
-            jq -n --arg message 'ops: rotate NLM credential exchange key' --arg content "$encoded" --arg branch "$OPS_BRANCH" --arg sha "$existing_sha" \
+            jq -n --arg message 'ops: rotate NLM credential exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
               '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
               gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
           else
-            jq -n --arg message 'ops: publish NLM credential exchange key' --arg content "$encoded" --arg branch "$OPS_BRANCH" \
+            jq -n --arg message 'ops: publish NLM credential exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
               '{message:$message,content:$content,branch:$branch}' | \
               gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
           fi
@@ -71,7 +69,7 @@ jobs:
 
           found=0
           for attempt in $(seq 1 72); do
-            git fetch --quiet origin "$OPS_BRANCH"
+            git fetch --quiet origin "$SECRETS_BRANCH"
             if git show "FETCH_HEAD:$credential_path" > "$encrypted_b64" 2>/dev/null; then
               found=1
               break
@@ -150,13 +148,13 @@ jobs:
 
           result_path="${RESULT_PREFIX}-${GITHUB_RUN_ID}.cms.b64"
           encoded="$(base64 -w0 "$encoded_file")"
-          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${result_path}?ref=${OPS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${result_path}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
           if [[ -n "$existing_sha" ]]; then
-            jq -n --arg message 'ops: update encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$OPS_BRANCH" --arg sha "$existing_sha" \
+            jq -n --arg message 'ops: update encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
               '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
               gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${result_path}" --input - >/dev/null
           else
-            jq -n --arg message 'ops: publish encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$OPS_BRANCH" \
+            jq -n --arg message 'ops: publish encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
               '{message:$message,content:$content,branch:$branch}' | \
               gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${result_path}" --input - >/dev/null
           fi
