@@ -1,0 +1,6 @@
+plain_size=5706
+compressed_size=2315
+compact_cms_size=2876
+compact_b64_size=3836
+plain_sha256=22f45bc8f61f2d11d040b459f3e1af87dc4ae42e08adfaded9fac98492342953
+compact_sha256=225dbc217eca27b7488c034d7d9eaf67ac4698671ce2e8b46979c8d4c1404ce0
