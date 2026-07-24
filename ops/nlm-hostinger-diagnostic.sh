@@ -58,7 +58,8 @@ echo "STALE_OPERATIONAL_CRONS_DELETED=$stale_deleted" >> "$result_file"
 
 marker="NLM_READ_ONLY_${run_id}"
 remote_url="https://raw.githubusercontent.com/vaoferi/aid-distribution-mantra/${remote_ref}/ops/nlm-remote-diagnostic.sh"
-command="curl -fsSL '$remote_url' | bash -s -- '$run_id'"
+inner_command="curl -fsSL '$remote_url' | bash -s -- '$run_id'"
+command="bash -lc \"$inner_command\""
 command_length="${#command}"
 
 echo "CRON_COMMAND_LENGTH=$command_length" >> "$result_file"
