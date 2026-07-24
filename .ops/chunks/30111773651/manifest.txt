@@ -1,0 +1,4 @@
+chunk_count=3
+chunk_size=3000
+sha256=ac06277cff8038d9993f28a4b37be5e1728095d15b74d24b1f0d0345ba0e7ad9
+source_size=8360
