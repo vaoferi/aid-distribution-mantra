@@ -21,6 +21,7 @@ jobs:
       EXCHANGE_KEY_PATH: .ops/nlm-exchange-public.pem
       CREDENTIAL_PREFIX: .ops/nlm-credentials
       RESULT_PREFIX: .ops/nlm-result
+      REMOTE_REF: ${{ github.event.pull_request.head.sha }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,7 +29,9 @@ jobs:
 
       - name: Validate emergency runner syntax
         shell: bash
-        run: bash -n ops/nlm-hostinger-diagnostic.sh
+        run: |
+          bash -n ops/nlm-hostinger-diagnostic.sh
+          bash -n ops/nlm-remote-diagnostic.sh
 
       - name: Generate one-time credential exchange key
         id: exchange
@@ -117,7 +120,8 @@ jobs:
             "$result_file" \
             "$primary_root" \
             "$cabinet_root" \
-            "$GITHUB_RUN_ID"
+            "$GITHUB_RUN_ID" \
+            "$REMOTE_REF"
           diagnostic_rc=$?
           set -e
           echo "DIAGNOSTIC_EXIT=$diagnostic_rc" >> "$result_file"
