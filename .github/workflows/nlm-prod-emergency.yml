@@ -1,0 +1,178 @@
+name: NLM production emergency runner
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nlm-prod-emergency-20260724
+  cancel-in-progress: true
+
+jobs:
+  diagnose:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SECRETS_BRANCH: ops/nlm-prod-secrets-20260724
+      EXCHANGE_KEY_PATH: .ops/nlm-exchange-public.pem
+      CREDENTIAL_PREFIX: .ops/nlm-credentials
+      RESULT_PREFIX: .ops/nlm-result
+      REMOTE_REF: ${{ github.event.pull_request.head.sha }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate emergency runner syntax
+        shell: bash
+        run: |
+          bash -n ops/nlm-hostinger-diagnostic.sh
+          bash -n ops/nlm-remote-diagnostic.sh
+
+      - name: Generate one-time credential exchange key
+        id: exchange
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          private_key="$RUNNER_TEMP/nlm-exchange-private.pem"
+          public_key="$RUNNER_TEMP/nlm-exchange-public.pem"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$private_key" 2>/dev/null
+          openssl pkey -in "$private_key" -pubout -out "$public_key" 2>/dev/null
+
+          encoded="$(base64 -w0 "$public_key")"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          if [[ -n "$existing_sha" ]]; then
+            jq -n --arg message 'ops: rotate NLM credential exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+              '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+          else
+            jq -n --arg message 'ops: publish NLM credential exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+              '{message:$message,content:$content,branch:$branch}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+          fi
+          echo "private_key=$private_key" >> "$GITHUB_OUTPUT"
+
+      - name: Receive encrypted production credentials
+        id: credentials
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          encrypted_b64="$RUNNER_TEMP/nlm-credentials.b64"
+          encrypted_bin="$RUNNER_TEMP/nlm-credentials.bin"
+          credentials_json="$RUNNER_TEMP/nlm-credentials.json"
+          credential_path="${CREDENTIAL_PREFIX}-${GITHUB_RUN_ID}.b64"
+
+          found=0
+          for attempt in $(seq 1 72); do
+            git fetch --quiet origin "$SECRETS_BRANCH"
+            if git show "FETCH_HEAD:$credential_path" > "$encrypted_b64" 2>/dev/null; then
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          [[ "$found" -eq 1 ]] || { echo 'Encrypted credentials were not supplied before timeout.' >&2; exit 3; }
+
+          base64 --decode "$encrypted_b64" > "$encrypted_bin"
+          openssl pkeyutl -decrypt \
+            -inkey '${{ steps.exchange.outputs.private_key }}' \
+            -in "$encrypted_bin" \
+            -out "$credentials_json" 2>/dev/null || {
+              echo 'Encrypted credentials do not match this workflow run.' >&2
+              exit 4
+            }
+
+          jq -e '.hostinger_token and .account_username and .primary_root and .cabinet_root' "$credentials_json" >/dev/null
+          chmod 600 "$credentials_json"
+          echo "credentials_json=$credentials_json" >> "$GITHUB_OUTPUT"
+
+      - name: Run encrypted read-only production diagnostic
+        id: diagnostic
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          credentials='${{ steps.credentials.outputs.credentials_json }}'
+          token_file="$RUNNER_TEMP/nlm-hostinger-token.txt"
+          result_file="$RUNNER_TEMP/nlm-production-result.txt"
+
+          jq -r '.hostinger_token' "$credentials" > "$token_file"
+          chmod 600 "$token_file"
+          api_base="$(jq -r '.api_base // "https://developers.hostinger.com"' "$credentials")"
+          account_username="$(jq -r '.account_username' "$credentials")"
+          primary_root="$(jq -r '.primary_root' "$credentials")"
+          cabinet_root="$(jq -r '.cabinet_root' "$credentials")"
+
+          echo 'DIAGNOSTIC_STARTED=1' > "$result_file"
+          set +e
+          bash ops/nlm-hostinger-diagnostic.sh \
+            "$api_base" \
+            "$account_username" \
+            "$token_file" \
+            "$result_file" \
+            "$primary_root" \
+            "$cabinet_root" \
+            "$GITHUB_RUN_ID" \
+            "$REMOTE_REF"
+          diagnostic_rc=$?
+          set -e
+          echo "DIAGNOSTIC_EXIT=$diagnostic_rc" >> "$result_file"
+          echo "result_file=$result_file" >> "$GITHUB_OUTPUT"
+          echo "diagnostic_rc=$diagnostic_rc" >> "$GITHUB_OUTPUT"
+
+      - name: Encrypt and publish diagnostic evidence
+        if: always()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          result='${{ steps.diagnostic.outputs.result_file }}'
+          if [[ -z "$result" || ! -f "$result" ]]; then
+            result="$RUNNER_TEMP/nlm-production-result.txt"
+            echo 'RESULT_UNAVAILABLE' > "$result"
+          fi
+
+          encrypted="$RUNNER_TEMP/nlm-result.cms"
+          encoded_file="$RUNNER_TEMP/nlm-result.cms.b64"
+          openssl cms -encrypt -binary -aes256 \
+            -in "$result" \
+            -out "$encrypted" \
+            -outform DER \
+            .ops/nlm-result-cert.pem 2>/dev/null
+          base64 -w0 "$encrypted" > "$encoded_file"
+
+          result_path="${RESULT_PREFIX}-${GITHUB_RUN_ID}.cms.b64"
+          encoded="$(base64 -w0 "$encoded_file")"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${result_path}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          if [[ -n "$existing_sha" ]]; then
+            jq -n --arg message 'ops: update encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+              '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${result_path}" --input - >/dev/null
+          else
+            jq -n --arg message 'ops: publish encrypted NLM diagnostic evidence' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+              '{message:$message,content:$content,branch:$branch}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${result_path}" --input - >/dev/null
+          fi
+
+      - name: Enforce diagnostic result
+        shell: bash
+        run: |
+          rc='${{ steps.diagnostic.outputs.diagnostic_rc }}'
+          [[ -n "$rc" ]] || exit 9
+          exit "$rc"
+
+      - name: Destroy local secret material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find "$RUNNER_TEMP" -maxdepth 1 -type f -name 'nlm-*' -exec shred -u {} +
