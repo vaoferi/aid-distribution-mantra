@@ -18,7 +18,7 @@ jobs:
     timeout-minutes: 10
     env:
       SECRETS_BRANCH: ops/nlm-prod-secrets-20260724
-      EXCHANGE_KEY_PATH: .ops/nlm-reducer-exchange-public.pem
+      EXCHANGE_CERT_PATH: .ops/nlm-reducer-exchange-cert.pem
       PRIVATE_KEY_PREFIX: .ops/nlm-reducer-private-key
       SOURCE_PATH: .ops/nlm-result-30111773651.cms.b64
       OUTPUT_PATH: .ops/nlm-result-30111773651.compact.cms.b64
@@ -28,7 +28,7 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Generate reducer exchange key
+      - name: Generate reducer exchange certificate
         id: exchange
         shell: bash
         env:
@@ -37,22 +37,26 @@ jobs:
           set -euo pipefail
           umask 077
           private_key="$RUNNER_TEMP/reducer-exchange-private.pem"
-          public_key="$RUNNER_TEMP/reducer-exchange-public.pem"
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$private_key" 2>/dev/null
-          openssl pkey -in "$private_key" -pubout -out "$public_key" 2>/dev/null
+          certificate="$RUNNER_TEMP/reducer-exchange-cert.pem"
+          openssl req -new -x509 -newkey rsa:3072 -nodes \
+            -keyout "$private_key" \
+            -out "$certificate" \
+            -days 1 \
+            -subj "/CN=NLM Reducer ${GITHUB_RUN_ID}" 2>/dev/null
 
-          encoded="$(base64 -w0 "$public_key")"
-          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          encoded="$(base64 -w0 "$certificate")"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_CERT_PATH}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
           if [[ -n "$existing_sha" ]]; then
-            jq -n --arg message 'ops: rotate NLM reducer exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+            jq -n --arg message 'ops: rotate NLM reducer exchange certificate' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
               '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
-              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_CERT_PATH}" --input - >/dev/null
           else
-            jq -n --arg message 'ops: publish NLM reducer exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+            jq -n --arg message 'ops: publish NLM reducer exchange certificate' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
               '{message:$message,content:$content,branch:$branch}' | \
-              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_CERT_PATH}" --input - >/dev/null
           fi
           echo "private_key=$private_key" >> "$GITHUB_OUTPUT"
+          echo "certificate=$certificate" >> "$GITHUB_OUTPUT"
 
       - name: Receive encrypted result decryption key
         id: key
@@ -60,10 +64,10 @@ jobs:
         run: |
           set -euo pipefail
           umask 077
-          encrypted_b64="$RUNNER_TEMP/reducer-key.b64"
-          encrypted_bin="$RUNNER_TEMP/reducer-key.bin"
+          encrypted_b64="$RUNNER_TEMP/reducer-key.cms.b64"
+          encrypted_cms="$RUNNER_TEMP/reducer-key.cms"
           result_private_key="$RUNNER_TEMP/result-private.pem"
-          key_path="${PRIVATE_KEY_PREFIX}-${GITHUB_RUN_ID}.b64"
+          key_path="${PRIVATE_KEY_PREFIX}-${GITHUB_RUN_ID}.cms.b64"
 
           found=0
           for attempt in $(seq 1 60); do
@@ -76,10 +80,11 @@ jobs:
           done
           [[ "$found" -eq 1 ]] || { echo 'Encrypted result key was not supplied before timeout.' >&2; exit 3; }
 
-          base64 --decode "$encrypted_b64" > "$encrypted_bin"
-          openssl pkeyutl -decrypt \
+          base64 --decode "$encrypted_b64" > "$encrypted_cms"
+          openssl cms -decrypt -binary -inform DER \
+            -in "$encrypted_cms" \
+            -recip '${{ steps.exchange.outputs.certificate }}' \
             -inkey '${{ steps.exchange.outputs.private_key }}' \
-            -in "$encrypted_bin" \
             -out "$result_private_key" 2>/dev/null || {
               echo 'Encrypted result key does not match this reducer run.' >&2
               exit 4
