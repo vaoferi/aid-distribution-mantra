@@ -1,0 +1,73 @@
+name: NLM encrypted result chunker
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+jobs:
+  chunk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      SECRETS_BRANCH: ops/nlm-prod-secrets-20260724
+      SOURCE_PATH: .ops/nlm-result-30111773651.cms.b64
+      CHUNK_DIR: .ops/chunks/30111773651
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Split encrypted evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          work="$RUNNER_TEMP/nlm-result-chunks"
+          mkdir -p "$work"
+          git fetch --quiet origin "$SECRETS_BRANCH"
+          git show "FETCH_HEAD:$SOURCE_PATH" > "$work/result.cms.b64"
+          sha256sum "$work/result.cms.b64" | awk '{print $1}' > "$work/sha256.txt"
+          split -b 3000 -d -a 3 "$work/result.cms.b64" "$work/chunk-"
+
+          count=0
+          for chunk in "$work"/chunk-*; do
+            name="$(basename "$chunk")"
+            path="$CHUNK_DIR/$name.txt"
+            encoded="$(base64 -w0 "$chunk")"
+            existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+            if [[ -n "$existing_sha" ]]; then
+              jq -n --arg message 'ops: update encrypted evidence chunk' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+                '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+                gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+            else
+              jq -n --arg message 'ops: publish encrypted evidence chunk' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+                '{message:$message,content:$content,branch:$branch}' | \
+                gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+            fi
+            count=$((count + 1))
+          done
+
+          {
+            echo "chunk_count=$count"
+            echo "chunk_size=3000"
+            echo "sha256=$(cat "$work/sha256.txt")"
+            echo "source_size=$(wc -c < "$work/result.cms.b64")"
+          } > "$work/manifest.txt"
+
+          path="$CHUNK_DIR/manifest.txt"
+          encoded="$(base64 -w0 "$work/manifest.txt")"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          if [[ -n "$existing_sha" ]]; then
+            jq -n --arg message 'ops: update encrypted evidence manifest' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+              '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+          else
+            jq -n --arg message 'ops: publish encrypted evidence manifest' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+              '{message:$message,content:$content,branch:$branch}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+          fi
