@@ -1,0 +1,167 @@
+name: NLM encrypted result reducer
+
+on:
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  contents: write
+
+concurrency:
+  group: nlm-result-reducer-20260724
+  cancel-in-progress: true
+
+jobs:
+  reduce:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      SECRETS_BRANCH: ops/nlm-prod-secrets-20260724
+      EXCHANGE_KEY_PATH: .ops/nlm-reducer-exchange-public.pem
+      PRIVATE_KEY_PREFIX: .ops/nlm-reducer-private-key
+      SOURCE_PATH: .ops/nlm-result-30111773651.cms.b64
+      OUTPUT_PATH: .ops/nlm-result-30111773651.compact.cms.b64
+      MANIFEST_PATH: .ops/nlm-result-30111773651.compact.manifest.txt
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate reducer exchange key
+        id: exchange
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          umask 077
+          private_key="$RUNNER_TEMP/reducer-exchange-private.pem"
+          public_key="$RUNNER_TEMP/reducer-exchange-public.pem"
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:3072 -out "$private_key" 2>/dev/null
+          openssl pkey -in "$private_key" -pubout -out "$public_key" 2>/dev/null
+
+          encoded="$(base64 -w0 "$public_key")"
+          existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+          if [[ -n "$existing_sha" ]]; then
+            jq -n --arg message 'ops: rotate NLM reducer exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+              '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+          else
+            jq -n --arg message 'ops: publish NLM reducer exchange key' --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+              '{message:$message,content:$content,branch:$branch}' | \
+              gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${EXCHANGE_KEY_PATH}" --input - >/dev/null
+          fi
+          echo "private_key=$private_key" >> "$GITHUB_OUTPUT"
+
+      - name: Receive encrypted result decryption key
+        id: key
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          encrypted_b64="$RUNNER_TEMP/reducer-key.b64"
+          encrypted_bin="$RUNNER_TEMP/reducer-key.bin"
+          result_private_key="$RUNNER_TEMP/result-private.pem"
+          key_path="${PRIVATE_KEY_PREFIX}-${GITHUB_RUN_ID}.b64"
+
+          found=0
+          for attempt in $(seq 1 60); do
+            git fetch --quiet origin "$SECRETS_BRANCH"
+            if git show "FETCH_HEAD:$key_path" > "$encrypted_b64" 2>/dev/null; then
+              found=1
+              break
+            fi
+            sleep 10
+          done
+          [[ "$found" -eq 1 ]] || { echo 'Encrypted result key was not supplied before timeout.' >&2; exit 3; }
+
+          base64 --decode "$encrypted_b64" > "$encrypted_bin"
+          openssl pkeyutl -decrypt \
+            -inkey '${{ steps.exchange.outputs.private_key }}' \
+            -in "$encrypted_bin" \
+            -out "$result_private_key" 2>/dev/null || {
+              echo 'Encrypted result key does not match this reducer run.' >&2
+              exit 4
+            }
+          openssl pkey -in "$result_private_key" -noout >/dev/null 2>&1
+          chmod 600 "$result_private_key"
+          echo "result_private_key=$result_private_key" >> "$GITHUB_OUTPUT"
+
+      - name: Decrypt, compress, and re-encrypt evidence
+        id: reduce
+        shell: bash
+        run: |
+          set -euo pipefail
+          umask 077
+          source_b64="$RUNNER_TEMP/source.cms.b64"
+          source_cms="$RUNNER_TEMP/source.cms"
+          plain="$RUNNER_TEMP/evidence.txt"
+          compressed="$RUNNER_TEMP/evidence.txt.gz"
+          compact_cms="$RUNNER_TEMP/compact.cms"
+          compact_b64="$RUNNER_TEMP/compact.cms.b64"
+          manifest="$RUNNER_TEMP/compact.manifest.txt"
+
+          git fetch --quiet origin "$SECRETS_BRANCH"
+          git show "FETCH_HEAD:$SOURCE_PATH" > "$source_b64"
+          base64 --decode "$source_b64" > "$source_cms"
+
+          openssl cms -decrypt -binary -inform DER \
+            -in "$source_cms" \
+            -recip .ops/nlm-result-cert.pem \
+            -inkey '${{ steps.key.outputs.result_private_key }}' \
+            -out "$plain" 2>/dev/null
+
+          gzip -9 -c "$plain" > "$compressed"
+          openssl cms -encrypt -binary -aes256 \
+            -in "$compressed" \
+            -out "$compact_cms" \
+            -outform DER \
+            .ops/nlm-result-cert.pem 2>/dev/null
+          base64 -w0 "$compact_cms" > "$compact_b64"
+
+          {
+            echo "plain_size=$(wc -c < "$plain")"
+            echo "compressed_size=$(wc -c < "$compressed")"
+            echo "compact_cms_size=$(wc -c < "$compact_cms")"
+            echo "compact_b64_size=$(wc -c < "$compact_b64")"
+            echo "plain_sha256=$(sha256sum "$plain" | awk '{print $1}')"
+            echo "compact_sha256=$(sha256sum "$compact_b64" | awk '{print $1}')"
+          } > "$manifest"
+
+          echo "compact_b64=$compact_b64" >> "$GITHUB_OUTPUT"
+          echo "manifest=$manifest" >> "$GITHUB_OUTPUT"
+
+      - name: Publish compact encrypted evidence
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          publish_file() {
+            local source="$1"
+            local path="$2"
+            local message="$3"
+            local encoded existing_sha
+            encoded="$(base64 -w0 "$source")"
+            existing_sha="$(gh api "repos/${GITHUB_REPOSITORY}/contents/${path}?ref=${SECRETS_BRANCH}" --jq '.sha' 2>/dev/null || true)"
+            if [[ -n "$existing_sha" ]]; then
+              jq -n --arg message "$message" --arg content "$encoded" --arg branch "$SECRETS_BRANCH" --arg sha "$existing_sha" \
+                '{message:$message,content:$content,branch:$branch,sha:$sha}' | \
+                gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+            else
+              jq -n --arg message "$message" --arg content "$encoded" --arg branch "$SECRETS_BRANCH" \
+                '{message:$message,content:$content,branch:$branch}' | \
+                gh api --method PUT "repos/${GITHUB_REPOSITORY}/contents/${path}" --input - >/dev/null
+            fi
+          }
+
+          publish_file '${{ steps.reduce.outputs.compact_b64 }}' "$OUTPUT_PATH" 'ops: publish compact encrypted NLM evidence'
+          publish_file '${{ steps.reduce.outputs.manifest }}' "$MANIFEST_PATH" 'ops: publish compact NLM evidence manifest'
+
+      - name: Destroy local key material
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          find "$RUNNER_TEMP" -maxdepth 1 -type f \( -name 'reducer-*' -o -name 'result-private.pem' -o -name 'source.cms*' -o -name 'evidence*' -o -name 'compact*' \) -exec shred -u {} +
